@@ -6,25 +6,49 @@ const { auth, RequiredScopes } = require('express-oauth2-jwt-bearer'); // Import
 const app = express();
 const port = process.env.PORT || 3000; // Render sets process.env.PORT
 
+// --- GLOBAL UNCAUGHT EXCEPTION & UNHANDLED REJECTION HANDLERS ---
+// This is critical for catching errors that might crash your server process
+// and sending them to the Render logs.
+process.on('uncaughtException', (error) => {
+    console.error('SERVER CRITICAL ERROR: Unhandled Exception Caught!', error);
+    // It's good practice to exit the process after logging a critical error
+    // so that Render (or your process manager) can restart it cleanly.
+    process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('SERVER CRITICAL ERROR: Unhandled Promise Rejection at:', promise, 'reason:', reason);
+    // It's good practice to exit the process after logging a critical error
+    // so that Render (or your process manager) can restart it cleanly.
+    process.exit(1);
+});
+// --- END GLOBAL ERROR HANDLERS ---
+
+
 // --- CORS Configuration ---
 const allowedOrigins = [
-  'http://localhost:5173', // For local frontend development
-  'https://aiscaffolddesigner.github.io/fluffy-octo-memory/' // Your deployed GitHub Pages frontend URL
+    'http://localhost:5173', // For local frontend development
+    'https://aiscaffolddesigner.github.io/fluffy-octo-memory/' // Your deployed GitHub Pages frontend URL
 ];
 
 app.use(cors({
-  origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps, Postman, or curl requests)
-    if (!origin) return callback(null, true);
-    // If the origin is in our allowed list, permit it
-    if (allowedOrigins.indexOf(origin) !== -1) {
-      callback(null, true);
-    } else {
-      // Block requests from other origins
-      const msg = `The CORS policy for this site does not allow access from the specified Origin: ${origin}`;
-      callback(new Error(msg), false);
+    origin: function (origin, callback) {
+        // Allow requests with no origin (like mobile apps, Postman, or curl requests)
+        if (!origin) {
+            console.log("CORS: Allowing request with null origin."); // Added log
+            return callback(null, true);
+        }
+        // If the origin is in our allowed list, permit it
+        if (allowedOrigins.indexOf(origin) !== -1) {
+            console.log(`CORS: Allowing request from origin: ${origin}`); // Added log
+            callback(null, true);
+        } else {
+            // Block requests from other origins
+            const msg = `The CORS policy for this site does not allow access from the specified Origin: ${origin}`;
+            console.error(`CORS Error: ${msg}`); // Added log
+            callback(new Error(msg), false);
+        }
     }
-  }
 }));
 
 console.log("CORS configured for origins:", allowedOrigins.join(', ')); // Log what origins are allowed
@@ -69,6 +93,11 @@ if (!AZURE_OPENAI_API_KEY || !AZURE_OPENAI_ENDPOINT || !AZURE_OPENAI_ASSISTANT_I
 
 
 // --- API Endpoints ---
+
+// Optional: Basic root endpoint for connectivity testing
+app.get('/', (req, res) => {
+    res.status(200).send('Backend is running and accessible!');
+});
 
 // Protect these routes with Auth0 middleware
 // Any request to these routes will now require a valid JWT in the Authorization header.
@@ -209,7 +238,7 @@ app.post('/api/chat', checkJwt, async (req, res) => {
                         console.log(`Executing tool: ${toolCall.function.name} with arguments: ${toolCall.function.arguments}`);
                         let output = "Tool function executed successfully with dummy output.";
                         if (toolCall.function.name === "get_current_weather") {
-                               output = JSON.stringify({ temperature: 22, unit: "celsius", description: "Sunny" });
+                                output = JSON.stringify({ temperature: 22, unit: "celsius", description: "Sunny" });
                         } else if (toolCall.function.name === "get_time") {
                             output = new Date().toLocaleTimeString();
                         }
@@ -304,5 +333,4 @@ app.use(function (err, req, res, next) {
 // --- Start the server ---
 app.listen(port, () => {
     console.log(`Server listening on port ${port}`);
-    // This console.log is now redundant as the CORS config is dynamic above
 });
