@@ -2,6 +2,9 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { auth, RequiredScopes } = require('express-oauth2-jwt-bearer'); // Import Auth0 middleware
+// If you're using @azure/openai, you'll need these:
+// const { OpenAIClient, AzureKeyCredential } = require('@azure/openai');
+// However, your code uses plain 'fetch' to the Azure OpenAI REST API, which is fine.
 
 const app = express();
 const port = process.env.PORT || 3000; // Render sets process.env.PORT
@@ -28,41 +31,43 @@ process.on('unhandledRejection', (reason, promise) => {
 // --- CORS Configuration ---
 const allowedOrigins = [
     'http://localhost:5173', // For local frontend development
-    'https://aiscaffolddesigner.github.io/fluffy-octo-memory/' // Your deployed GitHub Pages frontend URL
+    'https://aiscaffolddesigner.github.io', // Added this specific origin for the base domain
+    'https://aiscaffolddesigner.github.io/fluffy-octo-memory', // Corrected: Removed trailing slash
+    'null' // For Auth0 redirects or certain testing scenarios where origin might be null
 ];
 
 app.use(cors({
     origin: function (origin, callback) {
+        // Log the incoming origin for debugging
+        console.log(`CORS: Incoming request origin: ${origin}`);
+
         // Allow requests with no origin (like mobile apps, Postman, or curl requests)
-        if (!origin) {
-            console.log("CORS: Allowing request with null origin."); // Added log
+        // Also explicitly check if the origin is in our allowed list
+        if (!origin || allowedOrigins.includes(origin)) {
+            console.log(`CORS: Allowing request from origin: ${origin}`);
             return callback(null, true);
-        }
-        // If the origin is in our allowed list, permit it
-        if (allowedOrigins.indexOf(origin) !== -1) {
-            console.log(`CORS: Allowing request from origin: ${origin}`); // Added log
-            callback(null, true);
         } else {
             // Block requests from other origins
             const msg = `The CORS policy for this site does not allow access from the specified Origin: ${origin}`;
-            console.error(`CORS Error: ${msg}`); // Added log
+            console.error(`CORS Error: ${msg}`);
             callback(new Error(msg), false);
         }
-    }
+    },
+    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE', // Ensure POST is allowed
+    credentials: true // Allow cookies/authorization headers to be sent
 }));
 
-console.log("CORS configured for origins:", allowedOrigins.join(', ')); // Log what origins are allowed
+console.log("CORS configured for origins:", allowedOrigins.join(', '));
 
 // --- Express Middleware ---
-app.use(express.json());
+app.use(express.json()); // Parses JSON request bodies
 
 // --- Auth0 Configuration ---
 const AUTH0_ISSUER_BASE_URL = process.env.AUTH0_ISSUER_BASE_URL;
 const AUTH0_AUDIENCE = process.env.AUTH0_AUDIENCE;
 
 if (!AUTH0_ISSUER_BASE_URL || !AUTH0_AUDIENCE) {
-    console.error("ERROR: Missing Auth0 environment variables.");
-    console.error("Please ensure AUTH0_ISSUER_BASE_URL and AUTH0_AUDIENCE are set in your .env file.");
+    console.error("ERROR: Missing Auth0 environment variables. Please ensure AUTH0_ISSUER_BASE_URL and AUTH0_AUDIENCE are set.");
     process.exit(1);
 }
 
@@ -80,14 +85,13 @@ const checkJwt = auth({
 // --- Azure OpenAI Configuration Constants ---
 const AZURE_OPENAI_API_KEY = process.env.AZURE_OPENAI_API_KEY;
 const AZURE_OPENAI_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT;
-const AZURE_OPENAI_API_VERSION = "2024-05-01-preview";
+const AZURE_OPENAI_API_VERSION = "2024-05-01-preview"; // Confirmed your API version from Azure docs
 const AZURE_OPENAI_ASSISTANT_ID = process.env.AZURE_OPENAI_ASSISTANT_ID;
 
 const OPENAI_API_BASE_URL = `${AZURE_OPENAI_ENDPOINT}/openai`;
 
 if (!AZURE_OPENAI_API_KEY || !AZURE_OPENAI_ENDPOINT || !AZURE_OPENAI_ASSISTANT_ID) {
-    console.error("ERROR: Missing one or more required environment variables for Azure OpenAI.");
-    console.error("Please ensure AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, and AZURE_OPENAI_ASSISTANT_ID are set in your .env file.");
+    console.error("ERROR: Missing one or more required environment variables for Azure OpenAI. Please ensure AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, and AZURE_OPENAI_ASSISTANT_ID are set.");
     process.exit(1);
 }
 
@@ -103,8 +107,6 @@ app.get('/', (req, res) => {
 // Any request to these routes will now require a valid JWT in the Authorization header.
 app.post('/api/new-thread', checkJwt, async (req, res) => {
     console.log("Received request to /api/new-thread (protected)");
-    // User information (sub, email, etc.) from the JWT payload will be available at req.auth
-    // You can use req.auth.payload.sub to get the user's unique ID from Auth0
     const userId = req.auth.payload.sub;
     console.log("Authenticated user ID:", userId);
 
@@ -119,7 +121,9 @@ app.post('/api/new-thread', checkJwt, async (req, res) => {
             method: 'POST',
             headers: {
                 'api-key': AZURE_OPENAI_API_KEY,
-                'Content-Type': 'application/json'
+                'Content-Type': 'application/json',
+                // Add Assistant-specific header if required by your API version
+                'OpenAI-Beta': 'assistants=v2' // This is crucial for Assistant APIs
             },
             body: JSON.stringify({})
         });
@@ -139,9 +143,14 @@ app.post('/api/new-thread', checkJwt, async (req, res) => {
 
     } catch (error) {
         console.error('Error creating thread:', error.message);
-        console.error('Error details:', error);
+        // Log more details about the error if available from the API response
+        if (error.response && error.response.data) {
+            console.error('API Error Details (from response.data):', error.response.data);
+        } else if (error instanceof Error) {
+            console.error('Error Stack:', error.stack);
+        }
         res.status(500).json({
-            error: 'Failed to create thread',
+            error: 'Failed to create thread on server',
             details: error.message,
             code: error.code || 'UNKNOWN_ERROR'
         });
@@ -175,7 +184,8 @@ app.post('/api/chat', checkJwt, async (req, res) => {
             method: 'POST',
             headers: {
                 'api-key': AZURE_OPENAI_API_KEY,
-                'Content-Type': 'application/json'
+                'Content-Type': 'application/json',
+                'OpenAI-Beta': 'assistants=v2' // Crucial for Assistant APIs
             },
             body: JSON.stringify({
                 role: 'user',
@@ -197,7 +207,8 @@ app.post('/api/chat', checkJwt, async (req, res) => {
             method: 'POST',
             headers: {
                 'api-key': AZURE_OPENAI_API_KEY,
-                'Content-Type': 'application/json'
+                'Content-Type': 'application/json',
+                'OpenAI-Beta': 'assistants=v2' // Crucial for Assistant APIs
             },
             body: JSON.stringify({
                 assistant_id: AZURE_OPENAI_ASSISTANT_ID,
@@ -220,7 +231,10 @@ app.post('/api/chat', checkJwt, async (req, res) => {
 
             runResponse = await fetch(retrieveRunUrl, {
                 method: 'GET',
-                headers: { 'api-key': AZURE_OPENAI_API_KEY }
+                headers: {
+                    'api-key': AZURE_OPENAI_API_KEY,
+                    'OpenAI-Beta': 'assistants=v2' // Crucial for Assistant APIs
+                }
             });
 
             if (!runResponse.ok) {
@@ -237,6 +251,7 @@ app.post('/api/chat', checkJwt, async (req, res) => {
                     run.required_action.submit_tool_outputs.tool_calls.map(async (toolCall) => {
                         console.log(`Executing tool: ${toolCall.function.name} with arguments: ${toolCall.function.arguments}`);
                         let output = "Tool function executed successfully with dummy output.";
+                        // Implement your actual tool function logic here
                         if (toolCall.function.name === "get_current_weather") {
                                 output = JSON.stringify({ temperature: 22, unit: "celsius", description: "Sunny" });
                         } else if (toolCall.function.name === "get_time") {
@@ -255,7 +270,8 @@ app.post('/api/chat', checkJwt, async (req, res) => {
                     method: 'POST',
                     headers: {
                         'api-key': AZURE_OPENAI_API_KEY,
-                        'Content-Type': 'application/json'
+                        'Content-Type': 'application/json',
+                        'OpenAI-Beta': 'assistants=v2' // Crucial for Assistant APIs
                     },
                     body: JSON.stringify({ tool_outputs: toolOutputs })
                 });
@@ -285,7 +301,10 @@ app.post('/api/chat', checkJwt, async (req, res) => {
 
         const messagesResponse = await fetch(listMessagesUrl, {
             method: 'GET',
-            headers: { 'api-key': AZURE_OPENAI_API_KEY }
+            headers: {
+                'api-key': AZURE_OPENAI_API_KEY,
+                'OpenAI-Beta': 'assistants=v2' // Crucial for Assistant APIs
+            }
         });
 
         if (!messagesResponse.ok) {
