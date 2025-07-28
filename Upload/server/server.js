@@ -4,12 +4,30 @@ const cors = require('cors');
 const { auth, RequiredScopes } = require('express-oauth2-jwt-bearer'); // Import Auth0 middleware
 
 const app = express();
-const port = process.env.PORT || 3000;
+const port = process.env.PORT || 3000; // Render sets process.env.PORT
 
 // --- CORS Configuration ---
+const allowedOrigins = [
+  'http://localhost:5173', // For local frontend development
+  'https://aiscaffolddesigner.github.io/fluffy-octo-memory/' // Your deployed GitHub Pages frontend URL
+];
+
 app.use(cors({
-    origin: 'http://localhost:5173'
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps, Postman, or curl requests)
+    if (!origin) return callback(null, true);
+    // If the origin is in our allowed list, permit it
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      // Block requests from other origins
+      const msg = `The CORS policy for this site does not allow access from the specified Origin: ${origin}`;
+      callback(new Error(msg), false);
+    }
+  }
 }));
+
+console.log("CORS configured for origins:", allowedOrigins.join(', ')); // Log what origins are allowed
 
 // --- Express Middleware ---
 app.use(express.json());
@@ -48,12 +66,6 @@ if (!AZURE_OPENAI_API_KEY || !AZURE_OPENAI_ENDPOINT || !AZURE_OPENAI_ASSISTANT_I
     console.error("Please ensure AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, and AZURE_OPENAI_ASSISTANT_ID are set in your .env file.");
     process.exit(1);
 }
-
-console.log("Azure OpenAI Endpoint:", AZURE_OPENAI_ENDPOINT);
-console.log("Azure OpenAI API Version:", AZURE_OPENAI_API_VERSION);
-console.log("Azure OpenAI Assistant ID:", AZURE_OPENAI_ASSISTANT_ID);
-console.log("Auth0 Issuer Base URL:", AUTH0_ISSUER_BASE_URL);
-console.log("Auth0 Audience:", AUTH0_AUDIENCE);
 
 
 // --- API Endpoints ---
@@ -292,5 +304,5 @@ app.use(function (err, req, res, next) {
 // --- Start the server ---
 app.listen(port, () => {
     console.log(`Server listening on port ${port}`);
-    console.log(`CORS enabled for origin: ${process.env.NODE_ENV === 'production' ? 'https://aiscaffolddesigner.github.io/fluffy-octo-memory/' : 'http://localhost:5173'}`);
+    // This console.log is now redundant as the CORS config is dynamic above
 });
