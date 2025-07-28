@@ -292,5 +292,5 @@ app.use(function (err, req, res, next) {
 // --- Start the server ---
 app.listen(port, () => {
     console.log(`Server listening on port ${port}`);
-    console.log(`CORS enabled for origin: ${process.env.NODE_ENV === 'production' ? 'YOUR_PRODUCTION_FRONTEND_URL' : 'http://localhost:5173'}`);
+    console.log(`CORS enabled for origin: ${process.env.NODE_ENV === 'production' ? 'https://aiscaffolddesigner.github.io/fluffy-octo-memory/' : 'http://localhost:5173'}`);
 });
