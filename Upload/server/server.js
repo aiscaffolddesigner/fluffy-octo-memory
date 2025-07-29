@@ -1,66 +1,69 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { auth, RequiredScopes } = require('express-oauth2-jwt-bearer'); // Import Auth0 middleware
-// If you're using @azure/openai, you'll need these:
-// const { OpenAIClient, AzureKeyCredential } = require('@azure/openai');
-// However, your code uses plain 'fetch' to the Azure OpenAI REST API, which is fine.
+const { auth, RequiredScopes } = require('express-oauth2-jwt-bearer');
+
+const mongoose = require('mongoose'); // <-- NEW: Import Mongoose
+const User = require('./models/User'); // <-- NEW: Import your User model
 
 const app = express();
-const port = process.env.PORT || 3000; // Render sets process.env.PORT
+const port = process.env.PORT || 3000;
 
 // --- GLOBAL UNCAUGHT EXCEPTION & UNHANDLED REJECTION HANDLERS ---
-// This is critical for catching errors that might crash your server process
-// and sending them to the Render logs.
 process.on('uncaughtException', (error) => {
     console.error('SERVER CRITICAL ERROR: Unhandled Exception Caught!', error);
-    // It's good practice to exit the process after logging a critical error
-    // so that Render (or your process manager) can restart it cleanly.
     process.exit(1);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
     console.error('SERVER CRITICAL ERROR: Unhandled Promise Rejection at:', promise, 'reason:', reason);
-    // It's good practice to exit the process after logging a critical error
-    // so that Render (or your process manager) can restart it cleanly.
     process.exit(1);
 });
 // --- END GLOBAL ERROR HANDLERS ---
 
+// --- Database Connection --- // <-- NEW SECTION
+const DB_URI = process.env.MONGODB_URI;
+if (!DB_URI) {
+    console.error("ERROR: MONGODB_URI environment variable not set. Cannot connect to database.");
+    process.exit(1); // Exit if DB connection string is missing
+}
+
+mongoose.connect(DB_URI)
+    .then(() => console.log('MongoDB connected successfully!'))
+    .catch(err => {
+        console.error('MongoDB connection error:', err);
+        process.exit(1); // Exit if DB connection fails
+    });
+// --- END Database Connection ---
 
 // --- CORS Configuration ---
 const allowedOrigins = [
     'http://localhost:5173', // For local frontend development
-    'https://aiscaffolddesigner.github.io', // Added this specific origin for the base domain
-    'https://aiscaffolddesigner.github.io/fluffy-octo-memory', // Corrected: Removed trailing slash
-    'null' // For Auth0 redirects or certain testing scenarios where origin might be null
+    'https://aiscaffolddesigner.github.io',
+    'https://aiscaffolddesigner.github.io/fluffy-octo-memory',
+    'null'
 ];
 
 app.use(cors({
     origin: function (origin, callback) {
-        // Log the incoming origin for debugging
         console.log(`CORS: Incoming request origin: ${origin}`);
-
-        // Allow requests with no origin (like mobile apps, Postman, or curl requests)
-        // Also explicitly check if the origin is in our allowed list
         if (!origin || allowedOrigins.includes(origin)) {
             console.log(`CORS: Allowing request from origin: ${origin}`);
             return callback(null, true);
         } else {
-            // Block requests from other origins
             const msg = `The CORS policy for this site does not allow access from the specified Origin: ${origin}`;
             console.error(`CORS Error: ${msg}`);
             callback(new Error(msg), false);
         }
     },
-    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE', // Ensure POST is allowed
-    credentials: true // Allow cookies/authorization headers to be sent
+    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
+    credentials: true
 }));
 
 console.log("CORS configured for origins:", allowedOrigins.join(', '));
 
 // --- Express Middleware ---
-app.use(express.json()); // Parses JSON request bodies
+app.use(express.json());
 
 // --- Auth0 Configuration ---
 const AUTH0_ISSUER_BASE_URL = process.env.AUTH0_ISSUER_BASE_URL;
@@ -71,21 +74,16 @@ if (!AUTH0_ISSUER_BASE_URL || !AUTH0_AUDIENCE) {
     process.exit(1);
 }
 
-// Authorization middleware. When used, the Access Token must
-// exist and be verified against the Auth0 JSON Web Key Set.
 const checkJwt = auth({
     audience: AUTH0_AUDIENCE,
     issuerBaseURL: AUTH0_ISSUER_BASE_URL,
-    tokenSigningAlg: 'RS256' // Must match what you set in Auth0 API settings
+    tokenSigningAlg: 'RS256'
 });
-
-// Example for requiring specific scopes (permissions)
-// const checkScopes = RequiredScopes('read:messages'); // If you had specific scopes defined
 
 // --- Azure OpenAI Configuration Constants ---
 const AZURE_OPENAI_API_KEY = process.env.AZURE_OPENAI_API_KEY;
 const AZURE_OPENAI_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT;
-const AZURE_OPENAI_API_VERSION = "2024-05-01-preview"; // Confirmed your API version from Azure docs
+const AZURE_OPENAI_API_VERSION = "2024-05-01-preview";
 const AZURE_OPENAI_ASSISTANT_ID = process.env.AZURE_OPENAI_ASSISTANT_ID;
 
 const OPENAI_API_BASE_URL = `${AZURE_OPENAI_ENDPOINT}/openai`;
@@ -96,6 +94,88 @@ if (!AZURE_OPENAI_API_KEY || !AZURE_OPENAI_ENDPOINT || !AZURE_OPENAI_ASSISTANT_I
 }
 
 
+// --- NEW: User Management Middleware ---
+const ensureUserExists = async (req, res, next) => {
+    const auth0Id = req.auth.payload.sub; // Auth0's unique user ID
+
+    try {
+        let user = await User.findOne({ auth0Id });
+
+        if (!user) {
+            // First time user logs in: create a new user document with default trial status
+            console.log(`NEW USER: ${auth0Id}. Creating trial account.`);
+            user = new User({ auth0Id }); // planStatus and trialEndsAt will use defaults from schema
+            await user.save();
+            console.log(`Trial account created for ${auth0Id}, trial ends: ${user.trialEndsAt}`);
+        } else {
+            // Existing user
+            console.log(`EXISTING USER: ${auth0Id}, Plan: ${user.planStatus}, Trial ends: ${user.trialEndsAt}`);
+            // Optional: Update lastLogin, etc.
+        }
+
+        // Attach the user document to the request for subsequent middleware/route handlers
+        req.userRecord = user;
+        next();
+    } catch (error) {
+        console.error('Error in ensureUserExists middleware:', error);
+        res.status(500).json({ error: 'Server error during user lookup/creation' });
+    }
+};
+
+// --- NEW: Plan Check Middleware ---
+const checkUserPlan = async (req, res, next) => {
+    const user = req.userRecord; // User document attached by ensureUserExists
+
+    if (!user) {
+        // This should theoretically not happen if ensureUserExists runs first, but as a safeguard
+        console.error("User record not found in request during plan check.");
+        return res.status(500).json({ error: 'User data not available for plan check.' });
+    }
+
+    const now = new Date();
+
+    if (user.planStatus === 'trial') {
+        if (user.trialEndsAt && now > user.trialEndsAt) {
+            // Trial has expired
+            console.log(`TRIAL EXPIRED: User ${user.auth0Id}'s trial has expired.`);
+            // Update status in DB if it hasn't been already
+            if (user.planStatus !== 'expired') {
+                user.planStatus = 'expired';
+                await user.save();
+            }
+            return res.status(403).json({
+                error: 'Your trial has expired. Please upgrade to a premium plan.',
+                planStatus: 'expired'
+            });
+        } else if (user.trialEndsAt) {
+            // Trial is active
+            const daysRemaining = Math.ceil((user.trialEndsAt.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+            console.log(`TRIAL ACTIVE: User ${user.auth0Id} has ${daysRemaining} days left.`);
+            next(); // Proceed to the route handler
+        } else {
+            // Should not happen if trialEndsAt has a default, but a fallback
+            console.warn(`User ${user.auth0Id} is 'trial' but trialEndsAt is missing. Treating as active.`);
+            next();
+        }
+    } else if (user.planStatus === 'premium') {
+        console.log(`PREMIUM USER: User ${user.auth0Id} is a premium user.`);
+        next(); // Proceed to the route handler
+    } else if (user.planStatus === 'expired') {
+        console.log(`ACCESS DENIED: User ${user.auth0Id}'s plan is expired.`);
+        return res.status(403).json({
+            error: 'Your plan has expired. Please upgrade to a premium plan to continue.',
+            planStatus: 'expired'
+        });
+    } else {
+        // Handle unexpected planStatus, perhaps default to restricted access
+        console.warn(`UNKNOWN PLAN STATUS: User ${user.auth0Id} has unexpected planStatus: ${user.planStatus}. Denying access.`);
+        return res.status(403).json({
+            error: 'Access denied due to unknown plan status. Please contact support.',
+            planStatus: 'unknown'
+        });
+    }
+};
+
 // --- API Endpoints ---
 
 // Optional: Basic root endpoint for connectivity testing
@@ -103,15 +183,26 @@ app.get('/', (req, res) => {
     res.status(200).send('Backend is running and accessible!');
 });
 
-// Protect these routes with Auth0 middleware
-// Any request to these routes will now require a valid JWT in the Authorization header.
-app.post('/api/new-thread', checkJwt, async (req, res) => {
+// NEW: Endpoint for frontend to check user's plan status
+app.get('/api/user-status', checkJwt, ensureUserExists, async (req, res) => {
+    const user = req.userRecord;
+    res.status(200).json({
+        planStatus: user.planStatus,
+        trialEndsAt: user.trialEndsAt,
+        // You can add more info here like remaining credits if applicable
+    });
+});
+
+
+// Apply `checkJwt`, `ensureUserExists`, and `checkUserPlan` to protected routes
+app.post('/api/new-thread', checkJwt, ensureUserExists, checkUserPlan, async (req, res) => {
     console.log("Received request to /api/new-thread (protected)");
     const userId = req.auth.payload.sub;
     console.log("Authenticated user ID:", userId);
 
-    // TODO: Implement credit check logic here using userId
-    // If not enough credits, return res.status(403).json({ error: 'Not enough credits' });
+    // At this point, checkUserPlan has already ensured the user's plan allows access.
+    // If you had a credit-based system even for premium, you'd add that check here.
+    // const user = req.userRecord; // Access the user record here if needed
 
     try {
         const threadCreationUrl = `${OPENAI_API_BASE_URL}/threads?api-version=${AZURE_OPENAI_API_VERSION}`;
@@ -122,8 +213,7 @@ app.post('/api/new-thread', checkJwt, async (req, res) => {
             headers: {
                 'api-key': AZURE_OPENAI_API_KEY,
                 'Content-Type': 'application/json',
-                // Add Assistant-specific header if required by your API version
-                'OpenAI-Beta': 'assistants=v2' // This is crucial for Assistant APIs
+                'OpenAI-Beta': 'assistants=v2'
             },
             body: JSON.stringify({})
         });
@@ -137,13 +227,15 @@ app.post('/api/new-thread', checkJwt, async (req, res) => {
         console.log("New thread created:", thread.id);
 
         // TODO: Store thread.id in your database, associated with userId, for persistence
-        // e.g., saveThreadToDB(userId, thread.id);
+        // (This is beyond basic plan, but good for future: associate threads with user in DB)
+        // e.g., if you add a `threads: [String]` array to your User schema, you could do:
+        // req.userRecord.threads.push(thread.id);
+        // await req.userRecord.save();
 
         res.status(200).json({ threadId: thread.id });
 
     } catch (error) {
         console.error('Error creating thread:', error.message);
-        // Log more details about the error if available from the API response
         if (error.response && error.response.data) {
             console.error('API Error Details (from response.data):', error.response.data);
         } else if (error instanceof Error) {
@@ -157,7 +249,7 @@ app.post('/api/new-thread', checkJwt, async (req, res) => {
     }
 });
 
-app.post('/api/chat', checkJwt, async (req, res) => {
+app.post('/api/chat', checkJwt, ensureUserExists, checkUserPlan, async (req, res) => {
     const { threadId, message } = req.body;
     console.log(`Received chat request for threadId: ${threadId}, message: "${message}" (protected)`);
 
@@ -168,12 +260,16 @@ app.post('/api/chat', checkJwt, async (req, res) => {
         return res.status(400).json({ error: 'threadId and message are required' });
     }
 
-    // TODO: Implement credit deduction logic here using userId
-    // First, verify that `threadId` belongs to `userId` from your database for security.
-    // getThreadOwner(threadId) === userId
-    // If not, return 403 Forbidden.
-    // Then, deduct credits for this message. If not enough, return 403.
-
+    // At this point, checkUserPlan has already ensured the user's plan allows access.
+    // You might add additional checks here if, for example, a 'premium' plan had a message limit.
+    // For enhanced security, you should also verify that the `threadId` provided in the request
+    // actually belongs to the `userId` in your database. This prevents users from using
+    // other users' threads. This requires storing thread IDs with user records.
+    // Example (conceptual):
+    // const user = req.userRecord;
+    // if (!user.threads.includes(threadId)) {
+    //     return res.status(403).json({ error: 'Access to this thread is denied.' });
+    // }
 
     try {
         // 1. Add the user's message to the thread
@@ -185,7 +281,7 @@ app.post('/api/chat', checkJwt, async (req, res) => {
             headers: {
                 'api-key': AZURE_OPENAI_API_KEY,
                 'Content-Type': 'application/json',
-                'OpenAI-Beta': 'assistants=v2' // Crucial for Assistant APIs
+                'OpenAI-Beta': 'assistants=v2'
             },
             body: JSON.stringify({
                 role: 'user',
@@ -208,7 +304,7 @@ app.post('/api/chat', checkJwt, async (req, res) => {
             headers: {
                 'api-key': AZURE_OPENAI_API_KEY,
                 'Content-Type': 'application/json',
-                'OpenAI-Beta': 'assistants=v2' // Crucial for Assistant APIs
+                'OpenAI-Beta': 'assistants=v2'
             },
             body: JSON.stringify({
                 assistant_id: AZURE_OPENAI_ASSISTANT_ID,
@@ -233,7 +329,7 @@ app.post('/api/chat', checkJwt, async (req, res) => {
                 method: 'GET',
                 headers: {
                     'api-key': AZURE_OPENAI_API_KEY,
-                    'OpenAI-Beta': 'assistants=v2' // Crucial for Assistant APIs
+                    'OpenAI-Beta': 'assistants=v2'
                 }
             });
 
@@ -244,16 +340,14 @@ app.post('/api/chat', checkJwt, async (req, res) => {
             run = await runResponse.json();
             console.log(`Run ${run.id} status: ${run.status}`);
 
-            // Handle tool calls if your assistant uses them
             if (run.status === 'requires_action' && run.required_action) {
                 console.log('Run requires action (tool call(s) detected).');
                 const toolOutputs = await Promise.all(
                     run.required_action.submit_tool_outputs.tool_calls.map(async (toolCall) => {
                         console.log(`Executing tool: ${toolCall.function.name} with arguments: ${toolCall.function.arguments}`);
                         let output = "Tool function executed successfully with dummy output.";
-                        // Implement your actual tool function logic here
                         if (toolCall.function.name === "get_current_weather") {
-                                output = JSON.stringify({ temperature: 22, unit: "celsius", description: "Sunny" });
+                            output = JSON.stringify({ temperature: 22, unit: "celsius", description: "Sunny" });
                         } else if (toolCall.function.name === "get_time") {
                             output = new Date().toLocaleTimeString();
                         }
@@ -271,7 +365,7 @@ app.post('/api/chat', checkJwt, async (req, res) => {
                     headers: {
                         'api-key': AZURE_OPENAI_API_KEY,
                         'Content-Type': 'application/json',
-                        'OpenAI-Beta': 'assistants=v2' // Crucial for Assistant APIs
+                        'OpenAI-Beta': 'assistants=v2'
                     },
                     body: JSON.stringify({ tool_outputs: toolOutputs })
                 });
@@ -285,7 +379,6 @@ app.post('/api/chat', checkJwt, async (req, res) => {
             }
         }
 
-        // If the run failed, log the error
         if (run.status === 'failed') {
             console.error('Assistant run failed:', run.last_error);
             return res.status(500).json({
@@ -303,7 +396,7 @@ app.post('/api/chat', checkJwt, async (req, res) => {
             method: 'GET',
             headers: {
                 'api-key': AZURE_OPENAI_API_KEY,
-                'OpenAI-Beta': 'assistants=v2' // Crucial for Assistant APIs
+                'OpenAI-Beta': 'assistants=v2'
             }
         });
 
@@ -338,7 +431,7 @@ app.post('/api/chat', checkJwt, async (req, res) => {
     }
 });
 
-// --- Error Handling Middleware (Optional, but good practice) ---
+// --- Error Handling Middleware ---
 app.use(function (err, req, res, next) {
     if (err.name === 'UnauthorizedError') {
         return res.status(401).json({
@@ -346,7 +439,7 @@ app.use(function (err, req, res, next) {
             details: 'Invalid or missing token.'
         });
     }
-    next(err); // Pass other errors to the default Express error handler
+    next(err);
 });
 
 // --- Start the server ---
