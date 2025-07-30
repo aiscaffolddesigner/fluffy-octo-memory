@@ -1,10 +1,18 @@
+// server.js
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { auth, RequiredScopes } = require('express-oauth2-jwt-bearer');
+const { auth } = require('express-oauth2-jwt-bearer');
 
-const mongoose = require('mongoose'); // <-- NEW: Import Mongoose
-const User = require('./models/User'); // <-- NEW: Import your User model
+const mongoose = require('mongoose');
+const User = require('./models/User');
+
+// <-- NEW: Import Stripe library
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+
+// <-- NEW: Import the Fetch API polyfill if needed for older Node versions
+// For modern Node (18+), fetch is built-in.
+// const fetch = require('node-fetch');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -21,24 +29,24 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 // --- END GLOBAL ERROR HANDLERS ---
 
-// --- Database Connection --- // <-- NEW SECTION
+// --- Database Connection ---
 const DB_URI = process.env.MONGODB_URI;
 if (!DB_URI) {
     console.error("ERROR: MONGODB_URI environment variable not set. Cannot connect to database.");
-    process.exit(1); // Exit if DB connection string is missing
+    process.exit(1);
 }
 
 mongoose.connect(DB_URI)
     .then(() => console.log('MongoDB connected successfully!'))
     .catch(err => {
         console.error('MongoDB connection error:', err);
-        process.exit(1); // Exit if DB connection fails
+        process.exit(1);
     });
 // --- END Database Connection ---
 
 // --- CORS Configuration ---
 const allowedOrigins = [
-    'http://localhost:5173', // For local frontend development
+    'http://localhost:5173',
     'https://aiscaffolddesigner.github.io',
     'https://aiscaffolddesigner.github.io/fluffy-octo-memory',
     'null'
@@ -61,9 +69,6 @@ app.use(cors({
 }));
 
 console.log("CORS configured for origins:", allowedOrigins.join(', '));
-
-// --- Express Middleware ---
-app.use(express.json());
 
 // --- Auth0 Configuration ---
 const AUTH0_ISSUER_BASE_URL = process.env.AUTH0_ISSUER_BASE_URL;
@@ -93,27 +98,145 @@ if (!AZURE_OPENAI_API_KEY || !AZURE_OPENAI_ENDPOINT || !AZURE_OPENAI_ASSISTANT_I
     process.exit(1);
 }
 
+// --- NEW: Stripe Webhook Route (MUST come before express.json() if you use it globally) ---
+// We use express.raw to get the raw body, which is required for Stripe's signature verification.
+app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    let event;
 
-// --- NEW: User Management Middleware ---
+    try {
+        event = stripe.webhooks.constructEvent(
+            req.body,
+            sig,
+            process.env.STRIPE_WEBHOOK_SECRET
+        );
+    } catch (err) {
+        console.error(`⚠️  Webhook Error: ${err.message}`);
+        return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    // Handle the event
+    switch (event.type) {
+        case 'customer.subscription.created':
+        case 'customer.subscription.updated':
+            const subscription = event.data.object;
+            console.log(`Subscription ${subscription.id} status is now ${subscription.status}`);
+            try {
+                const customerId = subscription.customer;
+                const user = await User.findOne({ stripeCustomerId: customerId });
+
+                if (user) {
+                    let planStatus = 'expired';
+                    let trialEndsAt = null;
+
+                    if (subscription.status === 'active') {
+                        planStatus = 'premium';
+                    } else if (subscription.status === 'trialing') {
+                        planStatus = 'trial';
+                        trialEndsAt = new Date(subscription.trial_end * 1000);
+                    } else if (subscription.status === 'past_due' || subscription.status === 'canceled' || subscription.status === 'unpaid') {
+                        planStatus = 'expired';
+                    }
+
+                    user.planStatus = planStatus;
+                    user.stripeSubscriptionId = subscription.id;
+                    user.trialEndsAt = trialEndsAt;
+                    await user.save();
+                    console.log(`User ${user.auth0Id} plan updated to ${user.planStatus} via webhook.`);
+                } else {
+                    console.warn(`User not found for Stripe customer ID ${customerId}.`);
+                }
+            } catch (err) {
+                console.error('Error updating user on subscription webhook:', err);
+            }
+            break;
+
+        case 'customer.subscription.deleted':
+            const deletedSubscription = event.data.object;
+            console.log(`Subscription ${deletedSubscription.id} was deleted.`);
+            try {
+                const customerId = deletedSubscription.customer;
+                const user = await User.findOne({ stripeCustomerId: customerId });
+
+                if (user) {
+                    user.planStatus = 'expired'; // Or 'free' depending on your business logic
+                    user.stripeSubscriptionId = null;
+                    user.trialEndsAt = null;
+                    await user.save();
+                    console.log(`User ${user.auth0Id} plan set to expired after subscription deletion.`);
+                }
+            } catch (err) {
+                console.error('Error updating user on subscription deleted webhook:', err);
+            }
+            break;
+
+        case 'invoice.paid':
+            const invoice = event.data.object;
+            console.log(`Invoice ${invoice.id} for customer ${invoice.customer} was paid.`);
+            // You can add logic here to handle successful payment events.
+            // For subscription-based billing, the 'customer.subscription.updated'
+            // event often suffices, but this can be a good secondary check.
+            break;
+
+        case 'invoice.payment_failed':
+            const failedInvoice = event.data.object;
+            console.log(`Invoice ${failedInvoice.id} for customer ${failedInvoice.customer} payment failed.`);
+            try {
+                const user = await User.findOne({ stripeCustomerId: failedInvoice.customer });
+                if (user) {
+                    user.planStatus = 'expired'; // Or some other 'past_due' state
+                    await user.save();
+                    console.log(`User ${user.auth0Id} plan set to expired due to failed invoice payment.`);
+                }
+            } catch (err) {
+                console.error('Error updating user on failed invoice payment:', err);
+            }
+            break;
+
+        // Add other event types as needed
+        default:
+            console.log(`Unhandled event type ${event.type}`);
+    }
+
+    res.json({ received: true });
+});
+// --- END Stripe Webhook Route ---
+
+
+// --- Express Middleware (json parser) ---
+// This middleware is applied AFTER the webhook route to avoid parsing raw body
+app.use(express.json());
+
+
+// --- User Management Middleware ---
 const ensureUserExists = async (req, res, next) => {
-    const auth0Id = req.auth.payload.sub; // Auth0's unique user ID
+    const auth0Id = req.auth.payload.sub;
+    // <-- NEW: Also get email from the JWT payload
+    const email = req.auth.payload.email;
+    const name = req.auth.payload.name || req.auth.payload.nickname;
 
     try {
         let user = await User.findOne({ auth0Id });
 
         if (!user) {
-            // First time user logs in: create a new user document with default trial status
             console.log(`NEW USER: ${auth0Id}. Creating trial account.`);
-            user = new User({ auth0Id }); // planStatus and trialEndsAt will use defaults from schema
+            user = new User({
+                auth0Id,
+                email, // <-- NEW: Save email
+                name, // <-- NEW: Save name
+                planStatus: 'trial', // Set to trial for new users
+                trialEndsAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) // 7-day trial
+            });
             await user.save();
             console.log(`Trial account created for ${auth0Id}, trial ends: ${user.trialEndsAt}`);
         } else {
-            // Existing user
             console.log(`EXISTING USER: ${auth0Id}, Plan: ${user.planStatus}, Trial ends: ${user.trialEndsAt}`);
-            // Optional: Update lastLogin, etc.
+            // <-- NEW: Update email and name if they are in the token and not in the DB
+            if (!user.email && email) user.email = email;
+            if (!user.name && name) user.name = name;
+            await user.save(); // Save any updates
         }
 
-        // Attach the user document to the request for subsequent middleware/route handlers
         req.userRecord = user;
         next();
     } catch (error) {
@@ -122,12 +245,11 @@ const ensureUserExists = async (req, res, next) => {
     }
 };
 
-// --- NEW: Plan Check Middleware ---
+// --- Plan Check Middleware ---
 const checkUserPlan = async (req, res, next) => {
-    const user = req.userRecord; // User document attached by ensureUserExists
+    const user = req.userRecord;
 
     if (!user) {
-        // This should theoretically not happen if ensureUserExists runs first, but as a safeguard
         console.error("User record not found in request during plan check.");
         return res.status(500).json({ error: 'User data not available for plan check.' });
     }
@@ -136,9 +258,7 @@ const checkUserPlan = async (req, res, next) => {
 
     if (user.planStatus === 'trial') {
         if (user.trialEndsAt && now > user.trialEndsAt) {
-            // Trial has expired
             console.log(`TRIAL EXPIRED: User ${user.auth0Id}'s trial has expired.`);
-            // Update status in DB if it hasn't been already
             if (user.planStatus !== 'expired') {
                 user.planStatus = 'expired';
                 await user.save();
@@ -147,19 +267,11 @@ const checkUserPlan = async (req, res, next) => {
                 error: 'Your trial has expired. Please upgrade to a premium plan.',
                 planStatus: 'expired'
             });
-        } else if (user.trialEndsAt) {
-            // Trial is active
-            const daysRemaining = Math.ceil((user.trialEndsAt.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
-            console.log(`TRIAL ACTIVE: User ${user.auth0Id} has ${daysRemaining} days left.`);
-            next(); // Proceed to the route handler
         } else {
-            // Should not happen if trialEndsAt has a default, but a fallback
-            console.warn(`User ${user.auth0Id} is 'trial' but trialEndsAt is missing. Treating as active.`);
             next();
         }
     } else if (user.planStatus === 'premium') {
-        console.log(`PREMIUM USER: User ${user.auth0Id} is a premium user.`);
-        next(); // Proceed to the route handler
+        next();
     } else if (user.planStatus === 'expired') {
         console.log(`ACCESS DENIED: User ${user.auth0Id}'s plan is expired.`);
         return res.status(403).json({
@@ -167,7 +279,6 @@ const checkUserPlan = async (req, res, next) => {
             planStatus: 'expired'
         });
     } else {
-        // Handle unexpected planStatus, perhaps default to restricted access
         console.warn(`UNKNOWN PLAN STATUS: User ${user.auth0Id} has unexpected planStatus: ${user.planStatus}. Denying access.`);
         return res.status(403).json({
             error: 'Access denied due to unknown plan status. Please contact support.',
@@ -189,9 +300,54 @@ app.get('/api/user-status', checkJwt, ensureUserExists, async (req, res) => {
     res.status(200).json({
         planStatus: user.planStatus,
         trialEndsAt: user.trialEndsAt,
-        // You can add more info here like remaining credits if applicable
     });
 });
+
+// <-- NEW: Endpoint to create a Stripe Payment Intent for the checkout form -->
+app.post('/api/create-payment-intent', checkJwt, ensureUserExists, async (req, res) => {
+    const user = req.userRecord;
+    // Assuming you have a hardcoded price for a single product/subscription
+    // Or you can send a `priceId` from the frontend and validate it here.
+    const YOUR_PRICE_ID = process.env.STRIPE_PREMIUM_PRICE_ID; // Example from .env
+    const YOUR_PRODUCT_ID = process.env.STRIPE_PREMIUM_PRODUCT_ID; // Example from .env
+
+    try {
+        // Create a Stripe Customer if one doesn't exist
+        if (!user.stripeCustomerId) {
+            const customer = await stripe.customers.create({
+                email: user.email,
+                name: user.name,
+                metadata: {
+                    auth0Id: user.auth0Id,
+                },
+            });
+            user.stripeCustomerId = customer.id;
+            await user.save();
+        }
+
+        // For a subscription, it's more common to create a Subscription
+        // with the customer and price.
+        // A Payment Intent is for a one-time payment.
+        // Let's create a subscription with a payment method attached on the client side.
+        // This is a more robust approach for recurring payments.
+        const subscription = await stripe.subscriptions.create({
+            customer: user.stripeCustomerId,
+            items: [{
+                price: YOUR_PRICE_ID,
+            }],
+            payment_behavior: 'default_incomplete',
+            expand: ['latest_invoice.payment_intent'],
+        });
+
+        // The Payment Intent's client_secret is needed for the frontend's PaymentElement
+        const clientSecret = subscription.latest_invoice.payment_intent.client_secret;
+        res.status(200).json({ clientSecret });
+    } catch (error) {
+        console.error('Error creating Stripe Payment Intent/Subscription:', error);
+        res.status(500).json({ error: 'Failed to create payment intent.', details: error.message });
+    }
+});
+// <-- END NEW ENDPOINT -->
 
 
 // Apply `checkJwt`, `ensureUserExists`, and `checkUserPlan` to protected routes
@@ -199,10 +355,6 @@ app.post('/api/new-thread', checkJwt, ensureUserExists, checkUserPlan, async (re
     console.log("Received request to /api/new-thread (protected)");
     const userId = req.auth.payload.sub;
     console.log("Authenticated user ID:", userId);
-
-    // At this point, checkUserPlan has already ensured the user's plan allows access.
-    // If you had a credit-based system even for premium, you'd add that check here.
-    // const user = req.userRecord; // Access the user record here if needed
 
     try {
         const threadCreationUrl = `${OPENAI_API_BASE_URL}/threads?api-version=${AZURE_OPENAI_API_VERSION}`;
@@ -225,12 +377,6 @@ app.post('/api/new-thread', checkJwt, ensureUserExists, checkUserPlan, async (re
 
         const thread = await response.json();
         console.log("New thread created:", thread.id);
-
-        // TODO: Store thread.id in your database, associated with userId, for persistence
-        // (This is beyond basic plan, but good for future: associate threads with user in DB)
-        // e.g., if you add a `threads: [String]` array to your User schema, you could do:
-        // req.userRecord.threads.push(thread.id);
-        // await req.userRecord.save();
 
         res.status(200).json({ threadId: thread.id });
 
@@ -260,19 +406,7 @@ app.post('/api/chat', checkJwt, ensureUserExists, checkUserPlan, async (req, res
         return res.status(400).json({ error: 'threadId and message are required' });
     }
 
-    // At this point, checkUserPlan has already ensured the user's plan allows access.
-    // You might add additional checks here if, for example, a 'premium' plan had a message limit.
-    // For enhanced security, you should also verify that the `threadId` provided in the request
-    // actually belongs to the `userId` in your database. This prevents users from using
-    // other users' threads. This requires storing thread IDs with user records.
-    // Example (conceptual):
-    // const user = req.userRecord;
-    // if (!user.threads.includes(threadId)) {
-    //     return res.status(403).json({ error: 'Access to this thread is denied.' });
-    // }
-
     try {
-        // 1. Add the user's message to the thread
         const addMessageUrl = `${OPENAI_API_BASE_URL}/threads/${threadId}/messages?api-version=${AZURE_OPENAI_API_VERSION}`;
         console.log("Adding message to URL:", addMessageUrl);
 
@@ -295,7 +429,6 @@ app.post('/api/chat', checkJwt, ensureUserExists, checkUserPlan, async (req, res
         }
         console.log(`Message added to thread ${threadId}`);
 
-        // 2. Create and run the assistant on the thread
         const createRunUrl = `${OPENAI_API_BASE_URL}/threads/${threadId}/runs?api-version=${AZURE_OPENAI_API_VERSION}`;
         console.log("Creating run at URL:", createRunUrl);
 
@@ -318,7 +451,6 @@ app.post('/api/chat', checkJwt, ensureUserExists, checkUserPlan, async (req, res
         let run = await runResponse.json();
         console.log(`Run created with ID: ${run.id}, status: ${run.status}, associated thread_id: ${run.thread_id}`);
 
-        // 3. Poll the run status until it's completed or requires action
         while (run.status === 'queued' || run.status === 'in_progress' || run.status === 'requires_action') {
             await new Promise(resolve => setTimeout(resolve, 1000));
 
@@ -388,7 +520,6 @@ app.post('/api/chat', checkJwt, ensureUserExists, checkUserPlan, async (req, res
             });
         }
 
-        // 4. Retrieve messages from the thread
         const listMessagesUrl = `${OPENAI_API_BASE_URL}/threads/${run.thread_id}/messages?api-version=${AZURE_OPENAI_API_VERSION}`;
         console.log("Retrieving messages from URL:", listMessagesUrl);
 
@@ -407,7 +538,6 @@ app.post('/api/chat', checkJwt, ensureUserExists, checkUserPlan, async (req, res
         const messagesData = await messagesResponse.json();
         console.log(`Retrieved ${messagesData.data.length} messages from thread.`);
 
-        // 5. Find the latest assistant message from this run
         const latestAssistantMessage = messagesData.data.find(
             msg => msg.role === 'assistant' && msg.run_id === run.id && msg.content[0].type === 'text'
         );
