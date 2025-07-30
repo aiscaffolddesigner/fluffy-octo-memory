@@ -7,12 +7,12 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview",
-    "predeploy": "npm run build",  // This will run 'npm run build' before 'deploy'
-    "deploy": "VITE_DEPLOY_TARGET=github-pages gh-pages -d dist -b gh-pages" // This pushes your built files
+    "preview": "vite preview"
   },
   "dependencies": {
     "@auth0/auth0-react": "^2.4.0",
+    "@stripe/react-stripe-js": "^3.8.1",
+    "@stripe/stripe-js": "^7.7.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },
@@ -25,7 +25,6 @@
     "eslint-plugin-react-hooks": "^5.2.0",
     "eslint-plugin-react-refresh": "^0.4.20",
     "globals": "^16.3.0",
-    "gh-pages": "^6.0.0",  // <--- ADD THIS LINE
     "vite": "^7.0.3"
   }
 }

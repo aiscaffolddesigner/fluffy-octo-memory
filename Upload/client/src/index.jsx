@@ -11,9 +11,7 @@ const auth0Audience = import.meta.env.VITE_AUTH0_AUDIENCE;
 // ****** ADD THESE CONSOLE.LOGS *******
 console.log("TEST: index.jsx is running");
 
-console.log("DEBUG: VITE_AUTH0_DOMAIN from .env.local:", auth0Domain);
-console.log("DEBUG: VITE_AUTH0_CLIENT_ID from .env.local:", auth0ClientId);
-console.log("DEBUG: VITE_AUTH0_AUDIENCE from .env.local:", auth0Audience);
+
 // *************************************
 
 // Basic check for essential environment variables
@@ -39,7 +37,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(
       domain={auth0Domain}
       clientId={auth0ClientId}
       authorizationParams={{
-        redirect_uri: window.location.origin,
+        redirect_uri: window.location.origin + import.meta.env.BASE_URL, // <--- CHANGE THIS LINE
         audience: auth0Audience,
         scope: "openid profile email"
       }}
