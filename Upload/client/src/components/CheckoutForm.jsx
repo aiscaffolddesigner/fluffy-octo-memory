@@ -41,8 +41,7 @@ function CheckoutForm({ onPaymentSuccess, onPaymentError }) {
           return; // Stop execution if not authenticated
         }
 
-        const response = await fetch(`${import.meta.env.VITE_APP_API_URL}/create-payment-intent`, {
-          method: 'POST',
+const response = await fetch(`${import.meta.env.VITE_APP_API_URL}/api/create-payment-intent`, { // <-- ADD /api HERE          method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             'Authorization': `Bearer ${token}` // Use the obtained token here
